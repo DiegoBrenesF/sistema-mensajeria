@@ -38,7 +38,7 @@ int main() {
     }
 
     // 4. Enviar mensaje de registro como consumidor (¡termina con \n!)
-    char *registro = "REGISTER:CONSUMER\n";
+    char *registro = "REGISTER:CONSUMER:grupo1";
     if (send(sockfd, registro, strlen(registro), 0) == -1) {
         perror("Error al enviar mensaje de registro");
         close(sockfd);

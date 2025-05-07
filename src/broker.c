@@ -37,6 +37,7 @@
 #define PORT 8080
 #define MAX_CLIENTS 100
 #define BUFFER_SIZE 2048
+#define MAX_GROUP_NAME 64
 
 /* Tipos de clientes */
 #define CLIENT_TYPE_PRODUCER 1
@@ -84,6 +85,7 @@ typedef struct {
     int last_msg_offset;    /* Último mensaje recibido (offset) para consumidores */
     time_t last_activity;   /* Última actividad para detectar desconexiones */
     bool active;            /* Indica si el cliente está activo */
+    char group[MAX_GROUP_NAME];
 } client_t;
 
 /* Estructura para el control del broker */
@@ -880,29 +882,31 @@ void *client_handler(void *client_socket_ptr) {
         return NULL;
     }
     
-    /* Asegurar que buffer termina en nulo */
+    /* Asegurar que buffer termina en nulo */   
     buffer[bytes_read] = '\0';
     
     /* Procesar mensaje de registro */
-    int client_type = 0;
-    int consumer_id = 0;
-    
-    if (strncmp(buffer, "REGISTER:PRODUCER", 17) == 0) {
-        client_type = CLIENT_TYPE_PRODUCER;
-    } else if (strncmp(buffer, "REGISTER:CONSUMER", 17) == 0) {
-        client_type = CLIENT_TYPE_CONSUMER;
-        
-        /* Extraer ID de consumidor si se proporciona */
-        if (bytes_read > 18 && buffer[17] == ':') {
-            consumer_id = atoi(&buffer[18]);
-        }
-    } else {
-        /* Mensaje de registro inválido */
-        sprintf(response, "ERROR:Invalid registration message");
-        send(client_socket, response, strlen(response), 0);
-        close(client_socket);
-        return NULL;
+int client_type = 0;
+int consumer_id = 0;
+char grupo[MAX_GROUP_NAME] = {0};  // <- Agregamos una variable temporal
+
+if (strncmp(buffer, "REGISTER:PRODUCER", 17) == 0) {
+    client_type = CLIENT_TYPE_PRODUCER;
+} else if (strncmp(buffer, "REGISTER:CONSUMER:", 18) == 0) {
+    client_type = CLIENT_TYPE_CONSUMER;
+
+    char *grupo_recibido = &buffer[18];
+    if (strlen(grupo_recibido) >= MAX_GROUP_NAME) {
+        grupo_recibido[MAX_GROUP_NAME - 1] = '\0';
     }
+    strncpy(grupo, grupo_recibido, MAX_GROUP_NAME);  // Guardamos temporalmente
+} else {
+    /* Mensaje de registro inválido */
+    sprintf(response, "ERROR:Invalid registration message");
+    send(client_socket, response, strlen(response), 0);
+    close(client_socket);
+    return NULL;
+}
     
     /* Buscar un slot disponible para el cliente con manejo de mutex adecuado */
     if (pthread_mutex_lock(&broker.clients_mutex) != 0) {
@@ -917,7 +921,9 @@ void *client_handler(void *client_socket_ptr) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!broker.clients[i].active) {
             client_index = i;
-            
+            if (client_type == CLIENT_TYPE_CONSUMER) {
+    strncpy(broker.clients[i].group, grupo, MAX_GROUP_NAME);
+}  
             broker.clients[i].socket = client_socket;
             broker.clients[i].type = client_type;
             broker.clients[i].active = true;
@@ -1075,20 +1081,22 @@ void *client_handler(void *client_socket_ptr) {
 
 else if (client_type == CLIENT_TYPE_CONSUMER) {
     if (strncmp(buffer, "GET", 3) == 0) {
-        char msg_buffer[MAX_MSG_SIZE];
-        memset(msg_buffer, 0, sizeof(msg_buffer));
+        char msg_buffer[MAX_MSG_SIZE] = {0};
+
         ssize_t msg_size = mq_receive(broker.mq, msg_buffer, sizeof(msg_buffer));
+
         if (msg_size > 0) {
-            send(client_socket, msg_buffer, msg_size, 0);
+            snprintf(response, sizeof(response), "Mensaje recibido: %s", msg_buffer);
         } else {
-            sprintf(response, "ERROR:No messages available");
-            send(client_socket, response, strlen(response), 0);
+            snprintf(response, sizeof(response), "ERROR:No hay mensajes");
         }
+
+        send(client_socket, response, strlen(response), 0);
     } else {
-        sprintf(response, "ERROR:Unknown command");
+        snprintf(response, sizeof(response), "ERROR:Unknown command");
         send(client_socket, response, strlen(response), 0);
     }
-}        
+}
         /* Pequeña pausa para evitar uso excesivo de CPU */
         usleep(1000);  /* 1ms */
     }
@@ -1113,19 +1121,39 @@ else if (client_type == CLIENT_TYPE_CONSUMER) {
 void perform_message_distribution() {
     char notification[64];
     int count = mq_get_count(broker.mq);
-    
-    if (count > 0) {
-        pthread_mutex_lock(&broker.clients_mutex);
-        
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (broker.clients[i].active && broker.clients[i].type == CLIENT_TYPE_CONSUMER) {
-                sprintf(notification, "NOTIFY:MESSAGES_AVAILABLE:%d", count);
-                send(broker.clients[i].socket, notification, strlen(notification), 0);
+
+    if (count <= 0) return;
+
+    pthread_mutex_lock(&broker.clients_mutex);
+
+    char notified_groups[MAX_CLIENTS][MAX_GROUP_NAME];
+    int group_count = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!broker.clients[i].active || broker.clients[i].type != CLIENT_TYPE_CONSUMER)
+            continue;
+
+        // Ver si el grupo ya fue notificado
+        bool already_notified = false;
+        for (int j = 0; j < group_count; j++) {
+            if (strncmp(broker.clients[i].group, notified_groups[j], MAX_GROUP_NAME) == 0) {
+                already_notified = true;
+                break;
             }
         }
-        
-        pthread_mutex_unlock(&broker.clients_mutex);
+
+        if (!already_notified) {
+            // Notificar a este consumidor
+            snprintf(notification, sizeof(notification), "NOTIFY:MESSAGES_AVAILABLE:%d", count);
+            send(broker.clients[i].socket, notification, strlen(notification), 0);
+
+            // Registrar grupo ya notificado
+            strncpy(notified_groups[group_count], broker.clients[i].group, MAX_GROUP_NAME);
+            group_count++;
+        }
     }
+
+    pthread_mutex_unlock(&broker.clients_mutex);
 }
 
 /* Verifica y desconecta clientes inactivos */
